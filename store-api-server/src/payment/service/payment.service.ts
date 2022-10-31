@@ -19,8 +19,10 @@ import {
   SIMPLEX_WALLET_ID,
   SIMPLEX_ALLOWED_FIAT,
   STRIPE_PAYMENT_METHODS,
+  STRIPE_CHECKOUT_ENABLED,
   STRIPE_SECRET,
   VAT_FALLBACK_COUNTRY_SHORT,
+  STORE_FRONT_URL,
 } from '../../constants.js';
 import { UserService } from '../../user/service/user.service.js';
 import { NftService } from '../../nft/service/nft.service.js';
@@ -125,15 +127,19 @@ export class PaymentService {
 
     switch (constructedEvent.type) {
       case 'payment_intent.succeeded':
+      case 'checkout.session.completed':
+      case 'checkout.session.async_payment_succeeded':
         paymentStatus = PaymentStatus.SUCCEEDED;
         break;
       case 'payment_intent.processing':
         paymentStatus = PaymentStatus.PROCESSING;
         break;
       case 'payment_intent.canceled':
+      case 'checkout.session.expired':
         paymentStatus = PaymentStatus.CANCELED;
         break;
       case 'payment_intent.payment_failed':
+      case 'checkout.session.async_payment_failed':
         paymentStatus = PaymentStatus.FAILED;
         break;
       case 'payment_intent.created':
@@ -241,6 +247,7 @@ WHERE id = $1
         currency,
         amountUnit,
         clientIp,
+        order.nfts,
       );
       await this.#registerPayment(dbTx, orderId, paymentIntent);
 
@@ -510,6 +517,7 @@ WHERE nft_order_id = $1
     currency: string,
     amountUnit: number,
     clientIp: string,
+    nfts: NftEntity[],
   ): Promise<PaymentIntentInternal> {
     const { vatRate, ipCountry } = await this.#ipAddrVatRate(clientIp);
 
@@ -524,6 +532,7 @@ WHERE nft_order_id = $1
       currency,
       amountUnit,
       clientIp,
+      nfts,
     );
 
     let externalPaymentId: string | undefined;
@@ -561,6 +570,7 @@ WHERE nft_order_id = $1
     currency: string,
     amountUnit: number,
     clientIp: string,
+    nfts: NftEntity[],
   ) {
     switch (provider) {
       case PaymentProvider.TEZPAY:
@@ -572,7 +582,7 @@ WHERE nft_order_id = $1
         }
         return await this.#createTezPaymentDetails(paymentId, amountUnit);
       case PaymentProvider.STRIPE:
-        return await this.#createStripePaymentDetails(currency, amountUnit);
+        return await this.#createStripePaymentDetails(usr, currency, amountUnit, nfts);
       case PaymentProvider.WERT:
         const fiatCurrency = currency;
 
@@ -833,8 +843,10 @@ WHERE nft_order_id = $1
   }
 
   async #createStripePaymentDetails(
+    usr: UserEntity,
     currency: string,
     currencyUnitAmount: number,
+    nfts: NftEntity[],
   ): Promise<StripeDetails> {
     if (typeof this.stripe === 'undefined') {
       throw new HttpException(
@@ -849,27 +861,56 @@ WHERE nft_order_id = $1
       );
     }
 
-    const paymentIntent = await this.stripe.paymentIntents.create({
-      amount: currencyUnitAmount,
-      currency: currency,
-      payment_method_types: STRIPE_PAYMENT_METHODS,
-    });
+    if (STRIPE_CHECKOUT_ENABLED) {
+      const session = await this.stripe.checkout.sessions.create({
+        line_items: nfts.map(nft => ({
+          price_data: {
+            currency: currency,
+            product_data: {
+              name: nft.name,
+              description: nft.description,
+              images: [nft.thumbnailUri].filter(Boolean),
+            },
+            unit_amount: nft.price,
+            tax_behavior: 'inclusive',
+          },
+          quantity: 1,
+        })),
+        automatic_tax: { enabled: true },
+        mode: 'payment',
+        success_url: `${STORE_FRONT_URL}/${usr.userAddress}`,
+        cancel_url: `${STORE_FRONT_URL}/checkout`,
+      });
 
-    if (typeof paymentIntent.client_secret === 'undefined') {
-      const errShort = 'failed to create payment intent with stripe';
-      Logger.error(
-        `${errShort}, unexpected response from stripe.paymentIntents.create: ${JSON.stringify(
-          paymentIntent,
-        )}`,
-      );
-      throw new HttpException(errShort, HttpStatus.INTERNAL_SERVER_ERROR);
+      return {
+        id: session.id,
+        checkoutSessionUrl: session.url,
+        amount: currencyUnitAmount.toFixed(0),
+      };
+    } else {
+      const paymentIntent = await this.stripe.paymentIntents.create({
+        amount: currencyUnitAmount,
+        currency: currency,
+        payment_method_types: STRIPE_PAYMENT_METHODS,
+        description: nfts.map(nft => nft.name).join("\n"),
+      });
+
+      if (typeof paymentIntent.client_secret === 'undefined') {
+        const errShort = 'failed to create payment intent with stripe';
+        Logger.error(
+          `${errShort}, unexpected response from stripe.paymentIntents.create: ${JSON.stringify(
+            paymentIntent,
+          )}`,
+        );
+        throw new HttpException(errShort, HttpStatus.INTERNAL_SERVER_ERROR);
+      }
+
+      return {
+        id: paymentIntent.id,
+        clientSecret: paymentIntent.client_secret,
+        amount: currencyUnitAmount.toFixed(0),
+      };
     }
-
-    return {
-      id: paymentIntent.id,
-      clientSecret: paymentIntent.client_secret,
-      amount: currencyUnitAmount.toFixed(0),
-    };
   }
 
   async #createTezPaymentDetails(
@@ -1308,7 +1349,11 @@ RETURNING COALESCE(external_payment_id, payment_id) AS payment_id
         switch (provider) {
           // we could not add SIMPLEX. Because Simplex Team does not support cancel payment.
           case PaymentProvider.STRIPE:
-            await this.stripe.paymentIntents.cancel(paymentId);
+            if (STRIPE_CHECKOUT_ENABLED) {
+              await this.stripe.checkout.sessions.expire(paymentId);
+            } else {
+              await this.stripe.paymentIntents.cancel(paymentId);
+            }
             break;
           case PaymentProvider.TEZPAY:
           case PaymentProvider.WERT:
