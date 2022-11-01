@@ -52,7 +52,8 @@ export enum PaymentStatus {
 export type PaymentStatusString =  `${PaymentStatus}`
 
 export interface StripeDetails {
-  clientSecret: string;
+  clientSecret?: string;
+  checkoutSessionUrl?: string;
 }
 export interface WertDetails {
   wertData: any;
